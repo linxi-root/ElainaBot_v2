@@ -1,6 +1,6 @@
 # 频道适配模块
 
-把 QQ 频道的生命周期事件接入 ElainaBot：归一化事件字段、维护频道/子频道快照，并按 `event_types` 分发给插件。频道消息收发继续走框架核心，本模块补齐事件侧能力、全量频道管理接口、子频道图片与 Markdown 模板消息发送。
+把 QQ 频道的生命周期事件接入 ElainaBot：归一化事件字段、维护频道/子频道快照，并按 `event_types` 分发给插件。频道消息在进入核心通用分发前先由本模块的指令层匹配频道指令与频道主人权限，其余消息继续走框架核心；模块同时提供全量频道管理接口、子频道图片与 Markdown 模板消息发送，以及一个管理配置的 Web 页面。
 
 ## 启用
 
@@ -75,6 +75,38 @@ async def on_channel_change(event, match):
 - `event.is_at_other_bot`
 - `event.is_at_other_user`
 - `event.is_at_all`
+
+## 频道指令与频道主人
+
+频道消息（`AT_MESSAGE_CREATE`、`DIRECT_MESSAGE_CREATE`、`MESSAGE_CREATE`）在进入核心通用分发之前，会先经过本模块的指令拦截层 `ChannelCommandRouter`。命中频道指令后由模块直接执行处理器并结束事件，不再进入核心分发；未命中则原样交回核心。
+
+匹配规则：
+
+- 只有本模块 `data/config.yaml` 中 `channel_commands.prefixes` 里的前缀（默认 `/`）才视为指令。
+- `AT_MESSAGE_CREATE` 与 `DIRECT_MESSAGE_CREATE` 默认允许省略前缀（`at_without_prefix`）。
+- `MESSAGE_CREATE`（公开子频道消息）默认不处理，需要显式打开 `public_messages`。
+- `only_channel_handlers` 打开时只把指令分发给 `channel_only=True` 的处理器；关闭后也会匹配未声明场景的通用处理器，但始终跳过分组/单聊处理器。
+- 仍然遵循处理器自身的 `event_types`、机器人白名单、`block`、拦截器与黑名单。
+
+频道主人是本模块独立维护的列表，存放在 `data/config.yaml` 的 `channel_owners`，与 `config/bot.yaml` 的 `owner_ids` 互不影响：
+
+```yaml
+channel_owners:
+  - appid: '*'
+    user_ids:
+      - user_openid_a
+  - appid: '102030405'
+    user_ids:
+      - user_openid_b
+```
+
+`*` 组对所有机器人生效，按 appid 分组的主人只对该机器人生效，判定时会合并两组。声明了 `owner_only=True` 的频道指令只有频道主人能执行，其他人会收到 `denied_reply`（公开消息不回复）。`channel_owners` 也接受 `{appid: [user_id]}` 形式，面板保存时统一写成上面的列表形式。
+
+### Web 管理页面
+
+模块启用后会在 Web 面板注册「频道适配」页面（`source=module`），可以开关指令拦截、设置前缀与无权限回复，并按 appid 分组增删频道主人。页面通过 `/api/ext/channel-adapter/config` 读写模块配置，保存后立即生效并写回 `data/config.yaml`。
+
+该页面属于模块自身资产：`panel.py` 负责注册页面与路由，`assets/panel.html` 是界面，模块卸载时由 `teardown()` 注销。核心框架无需任何改动。
 
 ## 模块 API
 
@@ -323,9 +355,21 @@ default_appid: ""
 auto_private_intents: true
 subscribe_open_forum_events: false
 subscribe_audio_live_events: false
+channel_commands:
+  enabled: true
+  prefixes: ["/"]
+  at_without_prefix: true
+  public_messages: false
+  only_channel_handlers: true
+  denied_reply: 暂无频道指令权限
+channel_owners:
+  - appid: '*'
+    user_ids: []
 ```
 
 `auto_private_intents`、`subscribe_open_forum_events`、`subscribe_audio_live_events` 打开的 intent 如果被网关拒绝，模块会自动移除并重连，不需要手动改回配置。
+
+`channel_commands` 与 `channel_owners` 可以直接改文件，也可以在 Web 面板的「频道适配」页面维护；两者互不覆盖。`channel_owners` 里 `*` 表示所有机器人共用，其余是 appid。
 
 ## 插件调用示例
 

@@ -36,8 +36,10 @@ import time
 
 from core.application import get_app
 from core.base.logger import EXTENSION, get_logger, report_error
+from core.base.tasks import spawn
 
 from .api import ChannelAPI
+from .commands import COMMAND_EVENTS, ChannelCommandRouter, normalize_command_config, normalize_owners, owners_to_config
 
 log = get_logger(EXTENSION, '频道适配')
 
@@ -92,8 +94,6 @@ AUDIO_OFF_MIC = 'AUDIO_OFF_MIC'
 
 C2C_MSG_RECEIVE = 'C2C_MSG_RECEIVE'
 C2C_MSG_REJECT = 'C2C_MSG_REJECT'
-
-CHANNEL_MESSAGE_EVENTS = frozenset({AT_MESSAGE_CREATE, MESSAGE_CREATE})
 
 AUDIT_EVENTS = frozenset({MESSAGE_AUDIT_PASS, MESSAGE_AUDIT_REJECT})
 
@@ -189,6 +189,18 @@ _CHANNEL_KEYS = (
 _CHANNEL_SEND_PREFIXES = ('/channels/', '/dms/')
 _EVENT_TIMEOUT = 10
 _TEMPLATES_FILE = 'templates.yaml'
+_CONFIG_COMMENTS = {
+    'dispatch_to_plugins': '是否把频道事件分发给显式声明 event_types 的插件',
+    'persist_snapshots': '是否把频道/子频道快照写入 data/snapshots.json',
+    'enhance_channel_mentions': '是否补齐频道消息的 mentions/is_at_self 字段',
+    'default_appid': '多机器人时频道接口默认使用的 appid，留空则仅在单机器人时自动选择',
+    'auto_private_intents': '频道事件开启时是否尝试私域 GUILD_MESSAGES/FORUMS_EVENT，未授权自动回退',
+    'subscribe_open_forum_events': '是否尝试公域论坛 OPEN_FORUM_EVENT intent，未授权自动回退',
+    'subscribe_audio_live_events': '是否尝试音视频/直播成员 AUDIO_LIVE_MEMBER intent，未授权自动回退',
+    'log_show_name': '频道事件日志显示成员名称；关闭后仅显示成员 ID',
+    'channel_commands': '频道指令拦截设置；只影响频道消息，不影响群聊与单聊',
+    'channel_owners': '频道主人列表，按 appid 分组；* 表示所有机器人共用',
+}
 _TEMPLATES_TEMPLATE = """# 频道 Markdown 模板库（模块首次启动时自动生成）
 # QQ 频道模板属于具体机器人，模板 ID 形如 <机器人 appid>_<时间戳>
 # 修改后调用 adapter.reload_templates() 或重启模块
@@ -533,6 +545,7 @@ class ChannelAdapter:
         '_dirty',
         '_templates',
         'api',
+        'commands',
     )
 
     def __init__(self, ctx, cfg):
@@ -543,10 +556,26 @@ class ChannelAdapter:
         self._dirty = False
         self._templates = {}
         self.api = ChannelAPI(self)
+        self.commands = ChannelCommandRouter(self)
         self._load_snapshots()
         self.reload_templates()
 
     async def handle(self, event):
+        event_type = getattr(event, 'event_type', '')
+        if event_type in COMMAND_EVENTS:
+            if self._cfg.get('enhance_channel_mentions', True):
+                self._enhance_message(event)
+            try:
+                if await self.commands.handle(event):
+                    return None
+            except Exception as exc:
+                report_error(
+                    EXTENSION,
+                    '频道指令',
+                    exc,
+                    context={'appid': event.appid, 'event_type': event_type},
+                )
+            return event
         try:
             async with asyncio.timeout(_EVENT_TIMEOUT):
                 return await self._process_event(event)
@@ -569,11 +598,6 @@ class ChannelAdapter:
 
     async def _process_event(self, event):
         event_type = event.event_type
-        if event_type in CHANNEL_MESSAGE_EVENTS:
-            if self._cfg.get('enhance_channel_mentions', True):
-                self._enhance_message(event)
-            return event
-
         if event_type not in CHANNEL_EVENTS and event_type not in DIRECT_LIFECYCLE_EVENTS:
             return event
 
@@ -592,8 +616,6 @@ class ChannelAdapter:
             self._log_event(event)
 
         if self._cfg.get('dispatch_to_plugins', True):
-            from core.base.tasks import spawn
-
             spawn(self._dispatch(event))
 
         return event if event_type in CORE_SILENT_EVENTS else None
@@ -865,10 +887,18 @@ class ChannelAdapter:
         label = _event_label(code)
         guild_name, channel_name = self._event_names(event)
         username = _text(getattr(event, 'username', ''))
+        user_id = _text(getattr(event, 'user_id', ''))
+        # 开关打开时优先显示名称（框架里 event.username 通常是「名称(ID)」格式），
+        # 关闭时只显示成员 ID；两者都为空时互相回退，避免出现空括号。
+        if self._cfg.get('log_show_name', True):
+            display_user = username or user_id
+        else:
+            display_user = user_id or username
+        content = _text(getattr(event, 'content', ''))
         extra = json.dumps(event.raw, ensure_ascii=False)
         entry = {
             'type': label,
-            'user_id': username,
+            'user_id': display_user,
             'group_id': guild_name,
             'extra': extra,
         }
@@ -888,7 +918,7 @@ class ChannelAdapter:
                     'bot_name': bot.name,
                     'event_type': label,
                     'event_code': code,
-                    'user_id': username,
+                    'user_id': display_user,
                     'group_id': guild_name,
                     'guild_id': _text(getattr(event, 'guild_id', '')),
                     'channel_id': _text(getattr(event, 'channel_id', '')),
@@ -898,6 +928,7 @@ class ChannelAdapter:
             )
         except Exception:
             pass
+
 
     async def _dispatch(self, event):
         try:
@@ -1048,6 +1079,31 @@ class ChannelAdapter:
             return dict(self._cfg)
         return self._cfg.get(key, default)
 
+    def update_settings(self, values):
+        """更新并持久化模块配置，返回更新后的配置副本。"""
+        if not isinstance(values, dict):
+            raise ValueError('配置必须是字典')
+
+        config = dict(self._cfg)
+        config.update(values)
+        config['channel_commands'] = normalize_command_config(config.get('channel_commands'))
+        # 内存里统一用 dict 形式，和 setup() 保持一致
+        normalized_owners = normalize_owners(config.get('channel_owners'))
+        config['channel_owners'] = normalized_owners
+
+        # 落盘时用便于 YAML 阅读的 list 形式
+        save_payload = dict(config)
+        save_payload['channel_owners'] = owners_to_config(normalized_owners)
+        try:
+            self._ctx.save_config(save_payload, comments=_CONFIG_COMMENTS)
+        except TypeError:
+            # 兼容不支持 comments 参数的框架版本
+            self._ctx.save_config(save_payload)
+
+        self._cfg.clear()
+        self._cfg.update(config)
+        return dict(self._cfg)
+
     async def sync_guild(self, guild_id, *, appid=None):
         """拉取频道详情并合并到本地快照"""
         data = await self.api.fetch_guild(guild_id, appid=appid)
@@ -1088,17 +1144,22 @@ async def setup(ctx):
             'auto_private_intents': True,
             'subscribe_open_forum_events': False,
             'subscribe_audio_live_events': False,
+            'log_show_name': True,
+            'channel_commands': {
+                'enabled': True,
+                'prefixes': ['/'],
+                'at_without_prefix': True,
+                'public_messages': False,
+                'only_channel_handlers': True,
+                'denied_reply': '暂无频道指令权限',
+            },
+            'channel_owners': [{'appid': '*', 'user_ids': []}],
         },
-        comments={
-            'dispatch_to_plugins': '是否把频道事件分发给显式声明 event_types 的插件',
-            'persist_snapshots': '是否把频道/子频道快照写入 data/snapshots.json',
-            'enhance_channel_mentions': '是否补齐频道消息的 mentions/is_at_self 字段',
-            'default_appid': '多机器人时频道接口默认使用的 appid，留空则仅在单机器人时自动选择',
-            'auto_private_intents': '频道事件开启时是否尝试私域 GUILD_MESSAGES/FORUMS_EVENT，未授权自动回退',
-            'subscribe_open_forum_events': '是否尝试公域论坛 OPEN_FORUM_EVENT intent，未授权自动回退',
-            'subscribe_audio_live_events': '是否尝试音视频/直播成员 AUDIO_LIVE_MEMBER intent，未授权自动回退',
-        },
+        comments=_CONFIG_COMMENTS,
     )
+    cfg['channel_commands'] = normalize_command_config(cfg.get('channel_commands'))
+    cfg['channel_owners'] = normalize_owners(cfg.get('channel_owners'))
+
     from .intents import install as install_private_intents
 
     try:
@@ -1106,7 +1167,30 @@ async def setup(ctx):
     except (TypeError, ValueError):
         install_params = {}
 
-    install_kwargs = {'log': log} if 'log' in install_params else {}
+    def _load_intent_state():
+        raw = ctx.read_data('intents_state.json')
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _save_intent_state(payload):
+        try:
+            ctx.save_data('intents_state.json', json.dumps(payload, ensure_ascii=False, indent=2))
+        except Exception as exc:
+            log.warning(f'保存频道 intent 拒绝记录失败: {exc}')
+
+    install_kwargs = {}
+    if 'log' in install_params:
+        install_kwargs['log'] = log
+    if 'state_loader' in install_params:
+        install_kwargs['state_loader'] = _load_intent_state
+    if 'state_saver' in install_params:
+        install_kwargs['state_saver'] = _save_intent_state
+
     optional_flags = {
         'open_forum': bool(cfg.get('subscribe_open_forum_events', False)),
         'audio_live': bool(cfg.get('subscribe_audio_live_events', False)),
@@ -1118,6 +1202,7 @@ async def setup(ctx):
             log.warning(f'channel_adapter/intents.py 版本过旧，{name} 开关暂不生效，请同步该文件')
 
     install_private_intents(bool(cfg.get('auto_private_intents', True)), **install_kwargs)
+
     adapter = ChannelAdapter(ctx, cfg)
 
     @ctx.hook('before_event', priority=10)
@@ -1128,5 +1213,15 @@ async def setup(ctx):
     async def on_before_send(data):
         return _downgrade_channel_markdown(data)
 
+    from . import panel as channel_panel
+
+    channel_panel.register(ctx, adapter)
+
     log.info('频道事件适配已启用')
     return adapter
+
+
+async def teardown():
+    from . import panel as channel_panel
+
+    channel_panel.unregister()

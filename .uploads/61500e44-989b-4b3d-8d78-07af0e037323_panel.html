@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>频道适配</title>
+<style>
+  :root {
+    --bg: #f6f7fb;
+    --card: #ffffff;
+    --text: #1f2430;
+    --muted: #6b7385;
+    --line: #e4e7ef;
+    --accent: #5b8def;
+    --danger: #d64545;
+    --ok: #2f9e66;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 18px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 16px; font-size: 13px; }
+  .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .card h2 { font-size: 15px; margin: 0 0 12px; }
+  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+  .row:last-child { margin-bottom: 0; }
+  label.switch { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--line); cursor: pointer; }
+  label.switch:last-of-type { border-bottom: 0; }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 8px; }
+  input[type="text"], input[type="password"], textarea, select {
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
+    font: inherit; color: var(--text); background: #fff;
+  }
+  textarea { min-height: 82px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  input:focus, textarea:focus, select:focus { outline: 2px solid rgba(91, 141, 239, .25); border-color: var(--accent); }
+  button {
+    border: 1px solid var(--line); background: #fff; color: var(--text); border-radius: 7px;
+    padding: 8px 14px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #c8cfdd; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { filter: brightness(.95); }
+  button:disabled { opacity: .6; cursor: not-allowed; }
+  .owner-row { display: grid; grid-template-columns: 1fr auto; gap: 8px; margin-bottom: 8px; }
+  .owner-head { display: flex; align-items: center; justify-content: space-between; margin: 12px 0 8px; }
+  .owner-head strong { font-size: 13px; }
+  .owner-list { display: grid; gap: 8px; }
+  .chip { display: inline-flex; align-items: center; gap: 6px; background: #eef3ff; color: #3556a0; border-radius: 999px; padding: 3px 10px; font-size: 12px; }
+  .chip button { border: 0; background: transparent; padding: 0; color: inherit; font-size: 14px; line-height: 1; }
+  .toolbar { display: flex; gap: 10px; align-items: center; justify-content: flex-end; margin-top: 16px; }
+  .status { margin-right: auto; color: var(--muted); font-size: 13px; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--danger); }
+  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+  .tag { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 1px 8px; }
+  .wide { grid-column: 1 / -1; }
+  @media (max-width: 640px) {
+    body { padding: 12px; }
+    .toolbar { flex-wrap: wrap; justify-content: stretch; }
+    .status { width: 100%; }
+  }
+</style>
+</head>
+<body>
+  <h1>频道适配</h1>
+  <p class="sub">频道指令在进入核心通用分发前由本模块拦截；频道主人列表保存在模块自己的 data/config.yaml，与 bot.yaml 的 owner_ids 相互独立。</p>
+
+  <div class="grid">
+    <section class="card">
+      <h2>频道指令</h2>
+      <label class="switch">
+        <span>启用频道指令拦截</span>
+        <input type="checkbox" id="cmd-enabled">
+      </label>
+      <label class="switch">
+        <span>@机器人时允许不带前缀的指令</span>
+        <input type="checkbox" id="cmd-at">
+      </label>
+      <label class="switch">
+        <span>处理公开子频道消息（MESSAGE_CREATE）</span>
+        <input type="checkbox" id="cmd-public">
+      </label>
+      <label class="switch">
+        <span>只把指令分发给频道专属处理器</span>
+        <input type="checkbox" id="cmd-only">
+      </label>
+      <div class="row" style="margin-top:12px">
+        <div style="flex:1 1 200px">
+          <div class="hint" style="margin:0 0 6px">指令前缀，多个用英文逗号分隔，留空表示只靠 @ 触发</div>
+          <input type="text" id="cmd-prefixes" placeholder="/">
+        </div>
+      </div>
+      <div class="row">
+        <div style="flex:1 1 200px">
+          <div class="hint" style="margin:0 0 6px">无权限时回复内容，留空则不回复</div>
+          <input type="text" id="cmd-denied" placeholder="暂无频道指令权限">
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>事件日志</h2>
+      <label class="switch">
+        <span>显示成员名称（关闭后仅显示成员 ID）</span>
+        <input type="checkbox" id="log-name">
+      </label>
+      <div class="hint">
+        只影响本模块写入框架 lifecycle 日志与 Web 面板事件日志里的成员字段。打开时显示名称（如「睿晶琦(102042863)」），关闭时只显示成员 ID。
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>频道主人</h2>
+      <div class="hint" style="margin:0 0 10px">
+        输入成员的 OpenID，按回车添加。<code>*</code> 组对所有机器人生效；也可以为单个 appid 配置独立列表。
+        空分组（没有成员）保存时会被丢弃。
+      </div>
+      <div class="row">
+        <select id="owner-group" style="flex:1 1 200px"></select>
+        <button type="button" id="owner-add-group">新增分组</button>
+      </div>
+      <div class="owner-list" id="owner-list"></div>
+      <div class="row" style="margin-top:10px">
+        <input type="text" id="owner-input" placeholder="成员 OpenID，回车添加" autocomplete="off">
+        <button type="button" id="owner-add">添加</button>
+      </div>
+      <div class="hint" id="owner-tip"></div>
+    </section>
+  </div>
+
+  <div class="toolbar">
+    <span class="status" id="status">正在加载…</span>
+    <button type="button" id="reload">重新加载</button>
+    <button type="button" class="primary" id="save" disabled>保存配置</button>
+  </div>
+
+<script>
+(function () {
+  var state = { config: null, bots: [], owners: {}, group: '*' };
+  var API = '/api/ext/channel-adapter/config';
+
+  function el(id) { return document.getElementById(id); }
+
+  function setStatus(text, kind) {
+    var node = el('status');
+    node.textContent = text;
+    node.className = 'status' + (kind ? ' ' + kind : '');
+  }
+
+  function splitPrefixes(text) {
+    return String(text || '').split(',').map(function (x) { return x.trim(); }).filter(Boolean);
+  }
+
+  function ownerGroups() {
+    var groups = ['*'];
+    state.bots.forEach(function (bot) {
+      var key = String(bot.appid || '').trim();
+      if (key && groups.indexOf(key) === -1) groups.push(key);
+    });
+    Object.keys(state.owners).forEach(function (key) {
+      key = String(key || '').trim();
+      if (key && groups.indexOf(key) === -1) groups.push(key);
+    });
+    return groups;
+  }
+
+  function sanitizeOwners(raw) {
+    var result = { '*': [] };
+    if (!raw || typeof raw !== 'object') return result;
+    Object.keys(raw).forEach(function (key) {
+      var cleanKey = String(key || '').trim();
+      if (!cleanKey) return;
+      var list = raw[key];
+      if (!Array.isArray(list)) return;
+      var ids = list.map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+      if (cleanKey === '*' || ids.length) result[cleanKey] = ids;
+    });
+    if (!result['*']) result['*'] = [];
+    return result;
+  }
+
+  function renderGroups() {
+    var select = el('owner-group');
+    select.innerHTML = '';
+    ownerGroups().forEach(function (key) {
+      var option = document.createElement('option');
+      option.value = key;
+      var known = state.bots.filter(function (b) { return b.appid === key; })[0];
+      if (key === '*') {
+        option.textContent = '所有机器人（*）';
+      } else if (known) {
+        var suffix = known.running === false ? '（未运行）' : '';
+        option.textContent = known.name + ' · ' + key + suffix;
+      } else {
+        option.textContent = key;
+      }
+      select.appendChild(option);
+    });
+    if (ownerGroups().indexOf(state.group) === -1) state.group = '*';
+    select.value = state.group;
+  }
+
+  function renderOwners() {
+    var list = el('owner-list');
+    list.innerHTML = '';
+    var ids = state.owners[state.group] || [];
+    if (!ids.length) {
+      var empty = document.createElement('div');
+      empty.className = 'empty';
+      empty.textContent = '该分组还没有频道主人';
+      list.appendChild(empty);
+    }
+    ids.forEach(function (uid) {
+      var row = document.createElement('div');
+      row.className = 'owner-row';
+      var chip = document.createElement('span');
+      chip.className = 'chip';
+      chip.textContent = uid;
+      var del = document.createElement('button');
+      del.type = 'button';
+      del.textContent = '移除';
+      del.addEventListener('click', function () {
+        state.owners[state.group] = ids.filter(function (x) { return x !== uid; });
+        renderOwners();
+      });
+      row.appendChild(chip);
+      row.appendChild(del);
+      list.appendChild(row);
+    });
+    el('owner-tip').textContent = state.group === '*'
+      ? '当前分组对所有机器人生效。'
+      : '当前分组只对 appid ' + state.group + ' 生效，同时也会继承 * 分组。';
+  }
+
+  function fillForm() {
+    var cmd = (state.config && state.config.channel_commands) || {};
+    el('cmd-enabled').checked = cmd.enabled !== false;
+    el('cmd-at').checked = cmd.at_without_prefix !== false;
+    el('cmd-public').checked = !!cmd.public_messages;
+    el('cmd-only').checked = cmd.only_channel_handlers !== false;
+    el('cmd-prefixes').value = (cmd.prefixes || []).join(', ');
+    el('cmd-denied').value = cmd.denied_reply || '';
+    el('log-name').checked = !state.config || state.config.log_show_name !== false;
+    renderGroups();
+    renderOwners();
+  }
+
+  function collect() {
+    var owners = { '*': [] };
+    Object.keys(state.owners).forEach(function (key) {
+      var cleanKey = String(key || '').trim();
+      if (!cleanKey) return;
+      var ids = (state.owners[key] || []).map(function (x) { return String(x || '').trim(); }).filter(Boolean);
+      if (cleanKey === '*' || ids.length) owners[cleanKey] = ids;
+    });
+    return {
+      channel_commands: {
+        enabled: el('cmd-enabled').checked,
+        at_without_prefix: el('cmd-at').checked,
+        public_messages: el('cmd-public').checked,
+        only_channel_handlers: el('cmd-only').checked,
+        prefixes: splitPrefixes(el('cmd-prefixes').value),
+        denied_reply: el('cmd-denied').value.trim()
+      },
+      channel_owners: owners,
+      log_show_name: el('log-name').checked
+    };
+  }
+
+  function readResponse(res) {
+    return res.text().then(function (text) {
+      var data = null;
+      var trimmed = (text || '').trim();
+      if (trimmed) {
+        try {
+          data = JSON.parse(trimmed);
+        } catch (err) {
+          var preview = trimmed.slice(0, 200).replace(/\s+/g, ' ');
+          throw new Error('响应不是 JSON（HTTP ' + res.status + '）：' + preview);
+        }
+      }
+      if (!res.ok) {
+        throw new Error((data && data.error) || ('HTTP ' + res.status));
+      }
+      if (!data) throw new Error('响应为空（HTTP ' + res.status + '）');
+      return data;
+    });
+  }
+
+  function load() {
+    setStatus('正在加载…');
+    el('save').disabled = true;
+    fetch(API, { credentials: 'same-origin' })
+      .then(readResponse)
+      .then(function (data) {
+        if (!data || data.ok !== true) throw new Error((data && data.error) || '加载失败');
+        state.config = data.config || {};
+        state.bots = data.bots || [];
+        state.owners = sanitizeOwners(state.config.channel_owners);
+        if (ownerGroups().indexOf(state.group) === -1) state.group = '*';
+        fillForm();
+        el('save').disabled = false;
+        setStatus('已加载', 'ok');
+      })
+      .catch(function (err) {
+        setStatus('加载失败：' + (err && err.message ? err.message : err), 'err');
+      });
+  }
+
+  function save() {
+    setStatus('正在保存…');
+    el('save').disabled = true;
+    fetch(API, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(collect())
+    })
+      .then(readResponse)
+      .then(function (data) {
+        if (!data || data.ok !== true) throw new Error((data && data.error) || '保存失败');
+        state.config = data.config || {};
+        state.owners = sanitizeOwners(state.config.channel_owners);
+        if (ownerGroups().indexOf(state.group) === -1) state.group = '*';
+        fillForm();
+        setStatus('已保存，立即生效', 'ok');
+      })
+      .catch(function (err) {
+        setStatus('保存失败：' + (err && err.message ? err.message : err), 'err');
+        el('save').disabled = false;
+      })
+      .then(function () {
+        el('save').disabled = false;
+      });
+  }
+
+  el('owner-group').addEventListener('change', function (event) {
+    state.group = event.target.value;
+    renderOwners();
+  });
+
+  el('owner-add-group').addEventListener('click', function () {
+    var appid = window.prompt('输入机器人的 appid，或输入 * 表示所有机器人');
+    if (appid === null) return;
+    appid = appid.trim();
+    if (!appid) { window.alert('appid 不能为空'); return; }
+    if (/\s/.test(appid)) { window.alert('appid 不能包含空白字符'); return; }
+    if (!state.owners[appid]) state.owners[appid] = [];
+    state.group = appid;
+    renderGroups();
+    renderOwners();
+  });
+
+  function addOwner() {
+    var input = el('owner-input');
+    var uid = input.value.trim();
+    if (!uid) return;
+    var ids = state.owners[state.group] || [];
+    if (ids.indexOf(uid) === -1) ids.push(uid);
+    state.owners[state.group] = ids;
+    input.value = '';
+    renderOwners();
+  }
+
+  el('owner-add').addEventListener('click', addOwner);
+  el('owner-input').addEventListener('keydown', function (event) {
+    if (event.key === 'Enter') { event.preventDefault(); addOwner(); }
+  });
+  el('reload').addEventListener('click', load);
+  el('save').addEventListener('click', save);
+
+  load();
+})();
+</script>
+</body>
+</html>
