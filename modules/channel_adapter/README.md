@@ -1,6 +1,6 @@
 # 频道适配模块
 
-把 QQ 频道的生命周期事件接入 ElainaBot：归一化事件字段、维护频道/子频道快照，并按 `event_types` 分发给插件。频道消息在进入核心通用分发前先由本模块的指令层匹配频道指令与频道主人权限，其余消息继续走框架核心；模块同时提供全量频道管理接口、子频道图片与 Markdown 模板消息发送，以及一个管理配置的 Web 页面。
+把 QQ 频道的生命周期事件接入 ElainaBot：归一化事件字段、维护频道/子频道快照，并按 `event_types` 分发给插件。频道、群聊与好友消息在进入核心通用分发前先由本模块的指令层匹配通用指令与主人权限，其余消息继续走框架核心；模块同时提供全量频道管理接口、子频道图片与 Markdown 模板消息发送，以及一个管理配置的 Web 页面。
 
 ## 启用
 
@@ -76,19 +76,29 @@ async def on_channel_change(event, match):
 - `event.is_at_other_user`
 - `event.is_at_all`
 
-## 频道指令与频道主人
+## 通用指令与主人权限
 
-频道消息（`AT_MESSAGE_CREATE`、`DIRECT_MESSAGE_CREATE`、`MESSAGE_CREATE`）在进入核心通用分发之前，会先经过本模块的指令拦截层 `ChannelCommandRouter`。命中频道指令后由模块直接执行处理器并结束事件，不再进入核心分发；未命中则原样交回核心。
+频道、群聊与好友聊天消息在进入核心分发之前，会先经过本模块的指令拦截层 `ChannelCommandRouter`。命中指令后由模块直接执行处理器并结束事件，不再进入核心分发；未命中则原样交回核心。
+
+支持的场景：
+
+| 场景 | 事件 | 默认是否处理 | 前缀 |
+| --- | --- | --- | --- |
+| 频道 @机器人 / 私信 | `AT_MESSAGE_CREATE`、`DIRECT_MESSAGE_CREATE` | 是 | 可省略 |
+| 公开子频道消息 | `MESSAGE_CREATE` | 否，需要 `public_messages` | 必须 |
+| 群聊 @机器人 | `GROUP_AT_MESSAGE_CREATE` | 是 | 可省略 |
+| 群聊全量消息 | `GROUP_MESSAGE_CREATE` | 是，需要 `group_messages` | 被 @ 时可省略，否则必须 |
+| 好友聊天 | `C2C_MESSAGE_CREATE` | 是，需要 `c2c_messages` | 必须 |
 
 匹配规则：
 
-- 只有本模块 `data/config.yaml` 中 `channel_commands.prefixes` 里的前缀（默认 `/`）才视为指令。
-- `AT_MESSAGE_CREATE` 与 `DIRECT_MESSAGE_CREATE` 默认允许省略前缀（`at_without_prefix`）。
-- `MESSAGE_CREATE`（公开子频道消息）默认不处理，需要显式打开 `public_messages`。
-- `only_channel_handlers` 打开时只把指令分发给 `channel_only=True` 的处理器；关闭后也会匹配未声明场景的通用处理器，但始终跳过分组/单聊处理器。
+- 只有本模块 `data/config.yaml` 中 `channel_commands.prefixes` 里的前缀（默认 `/`）才视为指令；`AT_MESSAGE_CREATE`、`DIRECT_MESSAGE_CREATE`、`GROUP_AT_MESSAGE_CREATE` 允许省略前缀（`at_without_prefix`）。
+- 群聊全量消息默认必须带前缀，被 @ 时可省略；好友聊天默认必须带前缀，避免误触发。
+- 处理器场景由装饰器声明：`channel_only`、`group_only`、`direct_only`，都不声明表示三端通用。
+- `only_channel_handlers` 打开时，频道场景只分发给 `channel_only=True` 的处理器；群聊与好友聊天不受该开关影响。
 - 仍然遵循处理器自身的 `event_types`、机器人白名单、`block`、拦截器与黑名单。
 
-频道主人是本模块独立维护的列表，存放在 `data/config.yaml` 的 `channel_owners`，与 `config/bot.yaml` 的 `owner_ids` 互不影响：
+频道主人是本模块独立维护的列表，存放在 `data/config.yaml` 的 `channel_owners`，与 `config/bot.yaml` 的 `owner_ids` 互不影响。群聊与好友聊天的 `owner_only` 判定沿用框架的 `owner_ids`：
 
 ```yaml
 channel_owners:
@@ -100,11 +110,11 @@ channel_owners:
       - user_openid_b
 ```
 
-`*` 组对所有机器人生效，按 appid 分组的主人只对该机器人生效，判定时会合并两组。声明了 `owner_only=True` 的频道指令只有频道主人能执行，其他人会收到 `denied_reply`（公开消息不回复）。`channel_owners` 也接受 `{appid: [user_id]}` 形式，面板保存时统一写成上面的列表形式。
+`*` 组对所有机器人生效，按 appid 分组的主人只对该机器人生效，判定时会合并两组。声明了 `owner_only=True` 的频道指令默认允许 `channel_owners`、频道主（role=4）与管理员（role=2）执行，其他人会收到 `denied_reply`（公开子频道消息不回复）；给 handler 挂 `_role_ids` 可追加或收窄允许的身份组。`channel_owners` 也接受 `{appid: [user_id]}` 形式，面板保存时统一写成上面的列表形式。
 
 ### Web 管理页面
 
-模块启用后会在 Web 面板注册「频道适配」页面（`source=module`），可以开关指令拦截、设置前缀与无权限回复，并按 appid 分组增删频道主人。页面通过 `/api/ext/channel-adapter/config` 读写模块配置，保存后立即生效并写回 `data/config.yaml`。
+模块启用后会在 Web 面板注册「频道适配」页面（`source=module`），可以开关指令拦截、按场景开关、设置前缀与无权限回复，并按 appid 分组增删频道主人；事件日志可以分别控制成员名称与频道名称的显示。页面通过 `/api/ext/channel-adapter/config` 读写模块配置，保存后立即生效并写回 `data/config.yaml`。
 
 该页面属于模块自身资产：`panel.py` 负责注册页面与路由，`assets/panel.html` 是界面，模块卸载时由 `teardown()` 注销。核心框架无需任何改动。
 
@@ -122,13 +132,19 @@ adapter.channel_type_name(channel)
 
 # 主动拉取频道详情并更新快照
 await adapter.sync_guild(guild_id)
+
+# 插件开发辅助：统一回复、发图与场景判断，需 await
+await adapter.reply(event, '你好')
+await adapter.send_image(event, 'https://example.com/a.png', '看图')
+adapter.scene(event)      # channel / group / direct / unknown
+adapter.event_appid(event)
 ```
 
 快照默认写入 `modules/channel_adapter/data/snapshots.json`。
 
 ## 频道管理接口
 
-所有方法都是异步的，返回官方响应 JSON（对象或数组）。多机器人场景可传 `appid`；不传时使用 `default_appid`，仅有一个机器人时自动选择。接口失败会抛出 `ChannelAPIError`，其中包含 `code`、`data`、`method`、`endpoint`、`appid`。
+所有方法都是异步的，返回官方响应 JSON（对象或数组）。多机器人场景可传 `appid`；不传时优先使用当前事件来源机器人，其次使用 `default_appid`，仅有一个机器人时自动选择。在模块接管的指令处理器和频道事件处理器里调用时可以省略 `appid`；由框架核心分发的其他消息处理器建议显式传 `event.appid`。接口失败会抛出 `ChannelAPIError`，其中包含 `code`、`data`、`method`、`endpoint`、`appid`。
 
 ### 频道消息与图片
 
@@ -179,13 +195,11 @@ bots:
     default_template_id: '102030405_1658748972'
     templates:
       '102030405_1658748972':
-        description: 机器人信息卡
         content: |
           {{.botinfo}}
           {{.name}}
           {{.desc}}
           {{.list1}}
-        variables: [botinfo, name, desc, list1]
         params: [默认介绍, 默认名称, 默认描述, 默认列表]
       '102030405_1658749999': |
         # {{.title}}
@@ -200,8 +214,8 @@ bots:
 - `bots` 的键是机器人 appid；每个机器人有自己的 `default_template_id` 与 `templates`。
 - 模板 ID 的前缀应与该机器人的 appid 一致，不匹配时发送会直接报错，避免把 A 机器人的模板发给 B 机器人。
 - `default_template_id` 用于该机器人省略模板 ID 的调用。
-- `variables` 是模板变量的顺序；省略时按 `content` 中 `{{.变量}}` 首次出现的顺序自动提取。
-- `params` 用列表时按 `variables` 顺序绑定默认值，例如 `[默认1, 默认2]` 对应前两个变量。
+- 变量按 `content` 中 `{{.变量}}` 首次出现的顺序自动提取，无需手写 `variables`。
+- `params` 用列表时按变量顺序绑定默认值，例如 `[默认1, 默认2]` 对应前两个变量。
 - `params` 也支持 `{key: value}` 与 `[{key: values}]`，便于精确指定变量。
 - 只写字符串的简洁形式等价于 `{content: ..., params: {}}`。
 - 旧版扁平的 `default_template_id` / `templates` 仍可读取，模块会按模板 ID 前缀自动归属到对应机器人。
@@ -355,13 +369,18 @@ default_appid: ""
 auto_private_intents: true
 subscribe_open_forum_events: false
 subscribe_audio_live_events: false
+log_show_name: true
+log_show_channel_name: true
 channel_commands:
   enabled: true
   prefixes: ["/"]
   at_without_prefix: true
   public_messages: false
-  only_channel_handlers: true
-  denied_reply: 暂无频道指令权限
+  group_at_messages: true
+  group_messages: true
+  c2c_messages: true
+  only_channel_handlers: false
+  denied_reply: 暂无指令权限
 channel_owners:
   - appid: '*'
     user_ids: []
@@ -369,7 +388,7 @@ channel_owners:
 
 `auto_private_intents`、`subscribe_open_forum_events`、`subscribe_audio_live_events` 打开的 intent 如果被网关拒绝，模块会自动移除并重连，不需要手动改回配置。
 
-`channel_commands` 与 `channel_owners` 可以直接改文件，也可以在 Web 面板的「频道适配」页面维护；两者互不覆盖。`channel_owners` 里 `*` 表示所有机器人共用，其余是 appid。
+`group_at_messages`、`group_messages`、`c2c_messages` 分别控制群聊 @ 消息、群聊全量消息与好友聊天的指令拦截。`channel_commands` 与 `channel_owners` 可以直接改文件，也可以在 Web 面板的「频道适配」页面维护；两者互不覆盖。`channel_owners` 里 `*` 表示所有机器人共用，其余是 appid。
 
 ## 插件调用示例
 
@@ -386,7 +405,7 @@ guild = await adapter.api.fetch_guild(event.guild_id, appid=event.appid)
 await adapter.api.send_channel_image(event.channel_id, image_url, msg_id=event.message_id)
 ```
 
-示例插件注册了「频道信息」「子频道列表」「发图 <URL>」「模板列表」「模板消息 [模板ID] 值1，值2」五个频道命令，并演示了 `GUILD_MEMBER_ADD` 事件中读取快照。模板命令会按 `event.appid` 读取该机器人对应的模板；省略模板 ID 时使用默认模板。
+示例插件注册了「频道信息」「子频道列表」「发图 <URL>」「模板列表」「模板消息 [模板ID] 值1，值2」五个频道命令，均声明 `owner_only=True`，只有 `channel_owners`、频道主（role=4）与管理员（role=2）可执行；同时演示了 `GUILD_MEMBER_ADD` 事件中读取快照。模板命令会按 `event.appid` 读取该机器人对应的模板；省略模板 ID 时使用默认模板。
 
 ## 不在本模块范围
 

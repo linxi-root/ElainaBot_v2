@@ -4,6 +4,7 @@
 intent 下的频道生命周期事件，并把事件按显式 event_types 分发给插件。
 同时覆盖机器人频道列表、频道详情、子频道、成员、身份组与权限、接口授权、
 禁言、公告、精华消息、日程、音频、论坛帖子、子频道图片与 Markdown 模板消息等服务端接口。
+模块的指令拦截层同时支持频道、群聊（@ 与全量）和好友聊天，共用同一套指令。
 
 启用模块后，频道事件会填充 Event 的 guild_id / channel_id / user_id /
 content 等字段，插件可通过 event_types 显式订阅，例如:
@@ -24,7 +25,7 @@ OPEN_FORUM_EVENT 与音视频/直播成员 AUDIO_LIVE_MEMBER 可在配置中开�
 __module_meta__ = {
     'name': '频道事件适配',
     'description': 'QQ 频道全量管理接口与事件适配：子频道、成员、身份组、权限、发言、公告、精华、日程、音频、论坛、审核、单聊开关、图片与 Markdown 模板消息',
-    'version': '2.8.0',
+    'version': '2.10.0',
     'author': 'ElainaBot',
 }
 
@@ -39,7 +40,8 @@ from core.base.logger import EXTENSION, get_logger, report_error
 from core.base.tasks import spawn
 
 from .api import ChannelAPI
-from .commands import COMMAND_EVENTS, ChannelCommandRouter, normalize_command_config, normalize_owners, owners_to_config
+from .commands import COMMAND_EVENTS, ChannelCommandRouter, normalize_command_config, normalize_owners, owners_to_config, scene_name
+from .context import appid_context
 
 log = get_logger(EXTENSION, '频道适配')
 
@@ -189,20 +191,45 @@ _CHANNEL_KEYS = (
 _CHANNEL_SEND_PREFIXES = ('/channels/', '/dms/')
 _EVENT_TIMEOUT = 10
 _TEMPLATES_FILE = 'templates.yaml'
+_CONFIG_ORDER = (
+    'dispatch_to_plugins',
+    'persist_snapshots',
+    'enhance_channel_mentions',
+    'default_appid',
+    'auto_private_intents',
+    'subscribe_open_forum_events',
+    'subscribe_audio_live_events',
+    'log_show_name',
+    'log_show_channel_name',
+    'channel_commands',
+    'channel_owners',
+)
 _CONFIG_COMMENTS = {
     'dispatch_to_plugins': '是否把频道事件分发给显式声明 event_types 的插件',
     'persist_snapshots': '是否把频道/子频道快照写入 data/snapshots.json',
     'enhance_channel_mentions': '是否补齐频道消息的 mentions/is_at_self 字段',
-    'default_appid': '多机器人时频道接口默认使用的 appid，留空则仅在单机器人时自动选择',
+    'default_appid': '频道接口兜底 appid；留空时优先使用当前事件机器人，事件之外仅在单机器人时自动选择',
     'auto_private_intents': '频道事件开启时是否尝试私域 GUILD_MESSAGES/FORUMS_EVENT，未授权自动回退',
     'subscribe_open_forum_events': '是否尝试公域论坛 OPEN_FORUM_EVENT intent，未授权自动回退',
     'subscribe_audio_live_events': '是否尝试音视频/直播成员 AUDIO_LIVE_MEMBER intent，未授权自动回退',
     'log_show_name': '频道事件日志显示成员名称；关闭后仅显示成员 ID',
-    'channel_commands': '频道指令拦截设置；只影响频道消息，不影响群聊与单聊',
+    'log_show_channel_name': '频道事件日志显示频道/子频道名称；关闭后仅显示 ID',
+    'channel_commands': {
+        '__desc__': '通用指令拦截设置；统一作用于频道、群聊与好友聊天',
+        'enabled': '是否启用通用指令拦截',
+        'prefixes': '指令前缀列表，可配置多个',
+        'at_without_prefix': '频道/群 @机器人 时是否允许省略前缀',
+        'public_messages': '频道是否处理未 @机器人 的普通消息（需私域 GUILD_MESSAGES）',
+        'group_at_messages': '是否处理群聊 @机器人 消息（GROUP_AT_MESSAGE_CREATE）',
+        'group_messages': '是否处理群聊全量消息（GROUP_MESSAGE_CREATE）',
+        'c2c_messages': '是否处理好友聊天消息（C2C_MESSAGE_CREATE）',
+        'only_channel_handlers': '频道是否只匹配声明 channel_only 的指令；关闭后频道也匹配通用指令',
+        'denied_reply': '无权限时的回复内容；留空则不回复',
+    },
     'channel_owners': '频道主人列表，按 appid 分组；* 表示所有机器人共用',
 }
 _TEMPLATES_TEMPLATE = """# 频道 Markdown 模板库（模块首次启动时自动生成）
-# QQ 频道模板属于具体机器人，模板 ID 形如 <机器人 appid>_<时间戳>
+# 模板 ID 形如 <机器人 appid>_<时间戳>，前缀必须与机器人 appid 一致
 # 修改后调用 adapter.reload_templates() 或重启模块
 #
 # bots:
@@ -210,16 +237,13 @@ _TEMPLATES_TEMPLATE = """# 频道 Markdown 模板库（模块首次启动时自�
 #     default_template_id: '102030405_1658748972'
 #     templates:
 #       '102030405_1658748972':
-#         description: 机器人信息卡
 #         content: |
-#           {{.botinfo}}
-#           {{.name}}
+#           {{.title}}
 #           {{.desc}}
-#         variables: [botinfo, name, desc]
-#         params: [默认介绍, 默认名称, 默认描述]
+#         params: [默认标题, 默认描述]
 #
-# variables 可省略，模块会按 content 中 {{.变量}} 的出现顺序自动提取。
-# params 用列表时按 variables 顺序绑定默认值；发送时传 (值1, 值2) 即按位置覆盖。
+# 变量按 content 中 {{.变量}} 首次出现的顺序自动提取，无需手写 variables。
+# params 用列表时按变量顺序绑定默认值；发送时传 (值1, 值2) 即按位置覆盖。
 bots: {}
 """
 
@@ -473,8 +497,13 @@ def _ensure_templates(ctx):
         ctx.save_data(_TEMPLATES_FILE, _TEMPLATES_TEMPLATE)
         ctx.log.info(f'频道模板配置已自动生成: {_TEMPLATES_FILE}')
 
+    raw_text = ctx.read_data(_TEMPLATES_FILE) or ''
     raw = ctx.read_config(_TEMPLATES_FILE)
     if isinstance(raw, dict) and 'bots' not in raw and not raw.get('templates') and not _text(raw.get('default_template_id')).strip():
+        ctx.save_data(_TEMPLATES_FILE, _TEMPLATES_TEMPLATE)
+        raw = ctx.read_config(_TEMPLATES_FILE)
+    elif isinstance(raw, dict) and not raw.get('bots') and 'description: 机器人信息卡' in raw_text:
+        # 把旧版自动生成的空模板文件整理为精简示例
         ctx.save_data(_TEMPLATES_FILE, _TEMPLATES_TEMPLATE)
         raw = ctx.read_config(_TEMPLATES_FILE)
     if not isinstance(raw, dict):
@@ -561,6 +590,12 @@ class ChannelAdapter:
         self.reload_templates()
 
     async def handle(self, event):
+        # 绑定事件来源机器人；指令处理任务会继承该上下文，
+        # 插件不传 appid 时 ChannelAPI 自动使用收到消息的机器人。
+        with appid_context(getattr(event, 'appid', '')):
+            return await self._handle(event)
+
+    async def _handle(self, event):
         event_type = getattr(event, 'event_type', '')
         if event_type in COMMAND_EVENTS:
             if self._cfg.get('enhance_channel_mentions', True):
@@ -571,7 +606,7 @@ class ChannelAdapter:
             except Exception as exc:
                 report_error(
                     EXTENSION,
-                    '频道指令',
+                    '通用指令',
                     exc,
                     context={'appid': event.appid, 'event_type': event_type},
                 )
@@ -886,6 +921,8 @@ class ChannelAdapter:
         code = event.event_type
         label = _event_label(code)
         guild_name, channel_name = self._event_names(event)
+        guild_id = _text(getattr(event, 'guild_id', ''))
+        channel_id = _text(getattr(event, 'channel_id', ''))
         username = _text(getattr(event, 'username', ''))
         user_id = _text(getattr(event, 'user_id', ''))
         # 开关打开时优先显示名称（框架里 event.username 通常是「名称(ID)」格式），
@@ -894,12 +931,17 @@ class ChannelAdapter:
             display_user = username or user_id
         else:
             display_user = user_id or username
+        # 频道名称开关：打开时显示频道/子频道名称，关闭时显示 ID。
+        if self._cfg.get('log_show_channel_name', True):
+            display_group = ' / '.join(part for part in (guild_name or guild_id, channel_name or channel_id) if part)
+        else:
+            display_group = ' / '.join(part for part in (guild_id, channel_id) if part)
         content = _text(getattr(event, 'content', ''))
         extra = json.dumps(event.raw, ensure_ascii=False)
         entry = {
             'type': label,
             'user_id': display_user,
-            'group_id': guild_name,
+            'group_id': display_group,
             'extra': extra,
         }
         try:
@@ -919,9 +961,10 @@ class ChannelAdapter:
                     'event_type': label,
                     'event_code': code,
                     'user_id': display_user,
-                    'group_id': guild_name,
-                    'guild_id': _text(getattr(event, 'guild_id', '')),
-                    'channel_id': _text(getattr(event, 'channel_id', '')),
+                    'group_id': display_group,
+                    'guild_id': guild_id,
+                    'channel_id': channel_id,
+                    'channel_name': channel_name,
                     'content': content,
                     'raw_message': extra,
                 },
@@ -1104,6 +1147,48 @@ class ChannelAdapter:
         self._cfg.update(config)
         return dict(self._cfg)
 
+    # ==================== 插件开发辅助 ====================
+
+    @staticmethod
+    def scene(event):
+        """返回事件场景: channel / group / direct / unknown。"""
+        return scene_name(event)
+
+    @staticmethod
+    def event_appid(event):
+        """返回事件来源机器人 appid。"""
+        return _text(getattr(event, 'appid', ''))
+
+    @staticmethod
+    def _channel_target(event):
+        return (
+            getattr(event, 'is_channel', False)
+            and bool(getattr(event, 'channel_id', ''))
+            and getattr(event, 'event_type', '') in (AT_MESSAGE_CREATE, MESSAGE_CREATE)
+        )
+
+    def reply(self, event, content=None, **kwargs):
+        """统一回复入口，需要 await。
+
+        频道消息走 send_channel_message（自动带上被动回复 msg_id），
+        群聊与好友聊天走框架的 event.reply。
+        """
+        if self._channel_target(event):
+            kwargs.setdefault('msg_id', getattr(event, 'message_id', '') or None)
+            return self.api.send_channel_message(event.channel_id, content, appid=self.event_appid(event), **kwargs)
+        return event.reply(content, **kwargs)
+
+    def send_image(self, event, image, content='', **kwargs):
+        """统一发图入口，需要 await。
+
+        image 支持公网 URL、bytes、文件对象或本地路径；频道走频道图片接口，
+        群聊与好友聊天走框架的 reply_image。
+        """
+        if self._channel_target(event):
+            kwargs.setdefault('msg_id', getattr(event, 'message_id', '') or None)
+            return self.api.send_channel_image(event.channel_id, image, content, appid=self.event_appid(event), **kwargs)
+        return event.reply_image(image, content=content, **kwargs)
+
     async def sync_guild(self, guild_id, *, appid=None):
         """拉取频道详情并合并到本地快照"""
         data = await self.api.fetch_guild(guild_id, appid=appid)
@@ -1145,18 +1230,28 @@ async def setup(ctx):
             'subscribe_open_forum_events': False,
             'subscribe_audio_live_events': False,
             'log_show_name': True,
+            'log_show_channel_name': True,
             'channel_commands': {
                 'enabled': True,
                 'prefixes': ['/'],
                 'at_without_prefix': True,
                 'public_messages': False,
-                'only_channel_handlers': True,
-                'denied_reply': '暂无频道指令权限',
+                'group_at_messages': True,
+                'group_messages': True,
+                'c2c_messages': True,
+                'only_channel_handlers': False,
+                'denied_reply': '暂无指令权限',
             },
             'channel_owners': [{'appid': '*', 'user_ids': []}],
         },
         comments=_CONFIG_COMMENTS,
     )
+    ordered_keys = [key for key in _CONFIG_ORDER if key in cfg]
+    ordered_keys += [key for key in cfg if key not in _CONFIG_ORDER]
+    if list(cfg) != ordered_keys:
+        cfg = {key: cfg[key] for key in ordered_keys}
+        ctx.save_config(cfg, comments=_CONFIG_COMMENTS)
+        ctx.log.info('配置文件已按新布局整理: config.yaml')
     cfg['channel_commands'] = normalize_command_config(cfg.get('channel_commands'))
     cfg['channel_owners'] = normalize_owners(cfg.get('channel_owners'))
 

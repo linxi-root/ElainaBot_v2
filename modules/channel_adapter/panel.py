@@ -1,6 +1,6 @@
 """频道适配模块 Web 面板
 
-注册频道适配模块的配置页面与 /api/ext 路由，用于管理频道指令开关、
+注册频道适配模块的配置页面与 /api/ext 路由，用于管理通用指令开关、
 前缀、事件日志显示名和频道主人列表。
 """
 
@@ -77,6 +77,7 @@ def _snapshot(adapter):
         'channel_commands': normalize_command_config(config.get('channel_commands')),
         'channel_owners': normalize_owners(config.get('channel_owners')),
         'log_show_name': bool(config.get('log_show_name', True)),
+        'log_show_channel_name': bool(config.get('log_show_channel_name', True)),
     }
 
 
@@ -100,6 +101,8 @@ def register(ctx, adapter):
             values['channel_owners'] = payload.get('channel_owners')
         if 'log_show_name' in payload:
             values['log_show_name'] = bool(payload.get('log_show_name'))
+        if 'log_show_channel_name' in payload:
+            values['log_show_channel_name'] = bool(payload.get('log_show_channel_name'))
         if not values:
             return web.json_response({'ok': False, 'error': '没有可保存的字段'}, status=400)
 

@@ -10,6 +10,8 @@ import os
 
 from core.application import get_app
 
+from .context import current_appid
+
 try:
     import httpx as _httpx  # noqa: F401
     _HAS_HTTPX = True
@@ -183,6 +185,10 @@ class ChannelAPI:
             raise RuntimeError('应用尚未启动，无法调用频道接口')
 
         target = '' if appid is None else str(appid).strip()
+        # 优先级: 显式 appid > 当前事件来源机器人 > 配置 default_appid > 唯一机器人。
+        # 这样多机器人时，收到指令的机器人会自动成为接口调用方。
+        if not target:
+            target = current_appid()
         if not target:
             target = str(self._adapter.get_config('default_appid', '') or '').strip()
 

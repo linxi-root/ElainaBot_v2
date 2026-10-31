@@ -1,15 +1,16 @@
-"""频道指令拦截层
+"""通用指令拦截层
 
-在频道消息进入核心通用分发之前截获指令，按模块独立配置的频道主人列表
-判断权限，并且只把指令分发给频道场景的处理器。
+在事件进入核心通用分发之前截获指令，统一支持 QQ 频道、群聊（@ 与全量）
+和个人好友聊天，并按模块独立配置的频道主人列表判断权限。
 
 权限判定分两层：
-1. channel_owners（模块配置里的频道主人列表）：可执行全部 owner_only 指令
-2. 频道身份组（d.member.roles）：只有 handler 显式声明了 role_ids 且命中时，
-   非频道主人才可以执行该 owner_only 指令
+1. 频道场景使用 channel_owners（模块配置里的频道主人列表）；
+   群聊 / 好友聊天使用框架 bot.yaml 的 owner_ids。
+2. 频道身份组（d.member.roles）：handler 未声明 role_ids 时默认放行
+   频道主(4)与管理员(2)；显式声明 role_ids 时改为只放行声明的身份组，
+   声明空集合表示只允许主人执行。
 
-未声明 role_ids 的 owner_only 指令默认只允许 channel_owners 执行，
-符合最小权限原则。
+owner_only 指令只有在两层中任一层命中时才执行，否则回复 denied_reply。
 """
 
 from __future__ import annotations
@@ -22,23 +23,49 @@ from core.base.logger import EXTENSION, get_logger, report_error
 from core.base.tasks import spawn
 from core.plugin.context import _make_reply_log_cb
 
-log = get_logger(EXTENSION, '频道指令')
+log = get_logger(EXTENSION, '通用指令')
 
 AT_MESSAGE_CREATE = 'AT_MESSAGE_CREATE'
 MESSAGE_CREATE = 'MESSAGE_CREATE'
 DIRECT_MESSAGE_CREATE = 'DIRECT_MESSAGE_CREATE'
+GROUP_AT_MESSAGE_CREATE = 'GROUP_AT_MESSAGE_CREATE'
+GROUP_MESSAGE_CREATE = 'GROUP_MESSAGE_CREATE'
+C2C_MESSAGE_CREATE = 'C2C_MESSAGE_CREATE'
 
-COMMAND_EVENTS = frozenset({AT_MESSAGE_CREATE, MESSAGE_CREATE, DIRECT_MESSAGE_CREATE})
-_PUBLIC_EVENT = MESSAGE_CREATE
-_NO_PREFIX_EVENTS = frozenset({AT_MESSAGE_CREATE, DIRECT_MESSAGE_CREATE})
+CHANNEL_EVENTS = frozenset({AT_MESSAGE_CREATE, DIRECT_MESSAGE_CREATE, MESSAGE_CREATE})
+GROUP_EVENTS = frozenset({GROUP_AT_MESSAGE_CREATE, GROUP_MESSAGE_CREATE})
+C2C_EVENTS = frozenset({C2C_MESSAGE_CREATE})
+COMMAND_EVENTS = CHANNEL_EVENTS | GROUP_EVENTS | C2C_EVENTS
+
+# 场景位掩码，与 core/plugin/_dispatch.py 保持一致
+_S_GROUP = 1
+_S_DIRECT = 2
+_S_CHANNEL = 4
+
+_EVENT_SCENES = {
+    AT_MESSAGE_CREATE: _S_CHANNEL,
+    MESSAGE_CREATE: _S_CHANNEL,
+    DIRECT_MESSAGE_CREATE: _S_CHANNEL | _S_DIRECT,
+    GROUP_AT_MESSAGE_CREATE: _S_GROUP,
+    GROUP_MESSAGE_CREATE: _S_GROUP,
+    C2C_MESSAGE_CREATE: _S_DIRECT,
+}
+
+# 这些事件天然带 @，允许省略前缀
+_NO_PREFIX_EVENTS = frozenset({AT_MESSAGE_CREATE, DIRECT_MESSAGE_CREATE, GROUP_AT_MESSAGE_CREATE})
+# 公开场景无权限时不回复，避免刷屏
+_SILENT_DENIED_EVENTS = frozenset({MESSAGE_CREATE})
 
 COMMAND_DEFAULTS = {
     'enabled': True,
     'prefixes': ['/'],
     'at_without_prefix': True,
     'public_messages': False,
-    'only_channel_handlers': True,
-    'denied_reply': '暂无频道指令权限',
+    'group_at_messages': True,
+    'group_messages': True,
+    'c2c_messages': True,
+    'only_channel_handlers': False,
+    'denied_reply': '暂无指令权限',
 }
 
 _HANDLER_TIMEOUT = 300
@@ -63,6 +90,9 @@ def normalize_command_config(raw):
     enabled = _as_bool(source.get('enabled'), COMMAND_DEFAULTS['enabled'])
     at_without_prefix = _as_bool(source.get('at_without_prefix'), COMMAND_DEFAULTS['at_without_prefix'])
     public_messages = _as_bool(source.get('public_messages'), COMMAND_DEFAULTS['public_messages'])
+    group_at_messages = _as_bool(source.get('group_at_messages'), COMMAND_DEFAULTS['group_at_messages'])
+    group_messages = _as_bool(source.get('group_messages'), COMMAND_DEFAULTS['group_messages'])
+    c2c_messages = _as_bool(source.get('c2c_messages'), COMMAND_DEFAULTS['c2c_messages'])
     only_channel_handlers = _as_bool(source.get('only_channel_handlers'), COMMAND_DEFAULTS['only_channel_handlers'])
 
     raw_prefixes = source.get('prefixes') if 'prefixes' in source else COMMAND_DEFAULTS['prefixes']
@@ -84,6 +114,9 @@ def normalize_command_config(raw):
         'prefixes': prefixes,
         'at_without_prefix': at_without_prefix,
         'public_messages': public_messages,
+        'group_at_messages': group_at_messages,
+        'group_messages': group_messages,
+        'c2c_messages': c2c_messages,
         'only_channel_handlers': only_channel_handlers,
         'denied_reply': denied_reply,
     }
@@ -160,6 +193,37 @@ def owners_for(owners, appid):
     return merged
 
 
+# ==================== 场景判定 ====================
+
+
+def event_scene(event):
+    """返回事件的场景位掩码。"""
+    return _EVENT_SCENES.get(getattr(event, 'event_type', ''), 0)
+
+
+def scene_name(event):
+    """返回便于插件判断的场景名: channel / group / direct / unknown。"""
+    scene = event_scene(event)
+    if scene & _S_GROUP:
+        return 'group'
+    if scene & _S_CHANNEL:
+        return 'channel'
+    if scene & _S_DIRECT:
+        return 'direct'
+    return 'unknown'
+
+
+def handler_scene(handler):
+    """返回 handler 声明的场景位掩码；未声明表示全场景。"""
+    if not isinstance(handler, dict):
+        return 0
+    return (
+        (_S_GROUP if handler.get('group_only') else 0)
+        | (_S_DIRECT if handler.get('direct_only') else 0)
+        | (_S_CHANNEL if handler.get('channel_only') else 0)
+    )
+
+
 # ==================== 身份组放行 ====================
 # 非频道主人执行 owner_only 指令时，先看 handler 上显式声明的 role_ids，
 # 未声明时回退到这里的全局默认身份组：
@@ -171,21 +235,26 @@ _ELEVATED_ROLE_IDS = frozenset({'4', '2'})
 
 
 def _event_roles(event):
-    """从事件原始载荷里读取 d.member.roles，返回字符串集合。"""
+    """读取事件里的身份标识: 频道 d.member.roles 与群聊 author.member_role。"""
+    result = set()
+
+    role = str(getattr(event, 'member_role', '') or '').strip()
+    if role:
+        result.add(role)
+
     raw = getattr(event, 'raw', None)
     if not isinstance(raw, dict):
-        return set()
+        return result
 
     data = raw.get('d') if isinstance(raw.get('d'), dict) else raw
     member = data.get('member') if isinstance(data.get('member'), dict) else None
     if not member:
-        return set()
+        return result
 
     roles = member.get('roles')
     if not isinstance(roles, (list, tuple, set)):
-        return set()
+        return result
 
-    result = set()
     for item in roles:
         text = str(item).strip() if item is not None else ''
         if text:
@@ -197,7 +266,7 @@ def _wanted_roles(handler):
     """返回 handler 声明的角色 ID 集合。
 
     优先级：handler['role_ids'] > handler['func']._role_ids > 全局 _ELEVATED_ROLE_IDS。
-    显式声明空集合（() 或 []）表示该指令只允许 channel_owners。
+    显式声明空集合（() 或 []）表示该指令只允许主人执行。
     """
     roles = handler.get('role_ids')
     if roles is None:
@@ -213,7 +282,7 @@ def _wanted_roles(handler):
 
 
 def _allowed_by_roles(handler, event):
-    """非频道主人是否可以通过 d.member.roles 执行该 owner_only 指令。"""
+    """非主人是否可以通过身份组执行该 owner_only 指令。"""
     wanted = _wanted_roles(handler)
     if not wanted:
         return False
@@ -222,11 +291,28 @@ def _allowed_by_roles(handler, event):
 
 # ==================== 主人判定 ====================
 
+
+def _framework_owner(event):
+    app = get_app()
+    plugin_manager = getattr(app, 'plugin_manager', None) if app is not None else None
+    check = getattr(plugin_manager, '_is_owner', None)
+    if not callable(check):
+        return False
+    try:
+        return bool(check(event))
+    except Exception:
+        return False
+
+
 def _is_owner(event, owners):
     user_id = str(getattr(event, 'user_id', '') or '').strip()
     if not user_id:
         return False
-    return user_id in owners_for(owners, getattr(event, 'appid', ''))
+
+    scene = event_scene(event)
+    if scene & _S_CHANNEL and user_id in owners_for(owners, getattr(event, 'appid', '')):
+        return True
+    return _framework_owner(event)
 
 
 def _strip_prefix(text, prefixes):
@@ -248,7 +334,7 @@ def _slash_variants(text):
 
 
 class ChannelCommandRouter:
-    """频道指令拦截与频道主人权限控制。"""
+    """通用指令拦截与主人权限控制。"""
 
     __slots__ = ('_adapter',)
 
@@ -257,7 +343,8 @@ class ChannelCommandRouter:
 
     async def handle(self, event):
         """返回 True 表示事件已被接管，不再进入核心通用分发。"""
-        if getattr(event, 'event_type', '') not in COMMAND_EVENTS:
+        event_type = getattr(event, 'event_type', '')
+        if event_type not in COMMAND_EVENTS:
             return False
         content = str(getattr(event, 'content', '') or '')
         if not content:
@@ -271,13 +358,17 @@ class ChannelCommandRouter:
         settings = normalize_command_config(config.get('channel_commands'))
         if not settings['enabled']:
             return False
-        if event.event_type == _PUBLIC_EVENT and not settings['public_messages']:
+        if not self._scene_enabled(event_type, settings):
             return False
         if framework_cfg.get_bot_setting(appid, 'maintenance.enabled', False):
             return False
 
+        # 全量群消息里被 @ 时，也可以像 @ 消息一样省略前缀
+        at_optional = event_type in _NO_PREFIX_EVENTS or (
+            event_type == GROUP_MESSAGE_CREATE and bool(getattr(event, 'is_at_self', False))
+        )
         candidates, prefixed = _strip_prefix(content, settings['prefixes'])
-        if not prefixed and (event.event_type not in _NO_PREFIX_EVENTS or not settings['at_without_prefix']):
+        if not prefixed and (not at_optional or not settings['at_without_prefix']):
             return False
 
         app = get_app()
@@ -299,7 +390,7 @@ class ChannelCommandRouter:
                 if check_blacklist(event):
                     return False
             except Exception as exc:
-                report_error(EXTENSION, '频道指令', exc, context={'appid': appid, 'event_type': event.event_type})
+                report_error(EXTENSION, '通用指令', exc, context={'appid': appid, 'event_type': event_type})
 
         self._record_message(app, bot, event)
 
@@ -307,8 +398,20 @@ class ChannelCommandRouter:
             event.finish_dispatch()
             return True
 
-        log.debug(f'[{appid}] 频道指令拦截: {content[:80]}')
+        log.debug(f'[{appid}] 指令拦截[{scene_name(event)}]: {content[:80]}')
         spawn(self._run(matched, denied, event, settings))
+        return True
+
+    @staticmethod
+    def _scene_enabled(event_type, settings):
+        if event_type == MESSAGE_CREATE:
+            return bool(settings['public_messages'])
+        if event_type == GROUP_MESSAGE_CREATE:
+            return bool(settings['group_messages'])
+        if event_type == GROUP_AT_MESSAGE_CREATE:
+            return bool(settings['group_at_messages'])
+        if event_type == C2C_MESSAGE_CREATE:
+            return bool(settings['c2c_messages'])
         return True
 
     async def _run(self, matched, denied, event, settings):
@@ -336,7 +439,7 @@ class ChannelCommandRouter:
             try:
                 func(*args)
             except Exception as exc:
-                report_error(EXTENSION, '频道指令', exc, context={'appid': appid, 'event_type': event.event_type})
+                report_error(EXTENSION, '通用指令', exc, context={'appid': appid, 'event_type': event.event_type})
 
     async def _run_interceptors(self, plugin_manager, event):
         loop = asyncio.get_running_loop()
@@ -349,7 +452,7 @@ class ChannelCommandRouter:
             except Exception as exc:
                 report_error(
                     EXTENSION,
-                    interceptor.get('_plugin') or '频道指令',
+                    interceptor.get('_plugin') or '通用指令',
                     exc,
                     context={'appid': event.appid, 'event_type': event.event_type},
                 )
@@ -361,6 +464,7 @@ class ChannelCommandRouter:
     def _match(self, plugin_manager, event, candidates, settings, is_owner):
         appid = str(getattr(event, 'appid', '') or '')
         event_type = event.event_type
+        scene = event_scene(event)
         only_channel = settings['only_channel_handlers']
         matched = []
         denied = False
@@ -368,10 +472,12 @@ class ChannelCommandRouter:
         for handler in getattr(plugin_manager, '_all_handlers', []) or []:
             if handler.get('fallback'):
                 continue
-            if only_channel:
+
+            if only_channel and scene & _S_CHANNEL:
+                # 兼容旧行为：频道场景只匹配 channel_only 处理器
                 if not handler.get('channel_only'):
                     continue
-            elif handler.get('group_only') or handler.get('direct_only'):
+            elif handler_scene(handler) & ~scene:
                 continue
 
             event_types = handler.get('event_types')
@@ -393,7 +499,7 @@ class ChannelCommandRouter:
                 continue
 
             if handler.get('owner_only') and not is_owner:
-                # 非频道主人：只有显式声明了 role_ids 且角色命中才放行
+                # 非主人：只有显式声明了 role_ids 且角色命中才放行
                 if not _allowed_by_roles(handler, event):
                     denied = True
                     break
@@ -418,14 +524,14 @@ class ChannelCommandRouter:
             except TimeoutError:
                 report_error(
                     EXTENSION,
-                    '频道指令',
+                    '通用指令',
                     f'指令处理器 [{handler.get("name") or plugin_name}] 超时({_HANDLER_TIMEOUT}s)',
                     context={'appid': event.appid, 'event_type': event.event_type},
                 )
             except Exception as exc:
                 report_error(
                     EXTENSION,
-                    '频道指令',
+                    '通用指令',
                     exc,
                     context={'appid': event.appid, 'event_type': event.event_type, 'handler': handler.get('name') or ''},
                 )
@@ -445,9 +551,9 @@ class ChannelCommandRouter:
 
     async def _reply_denied(self, event, settings):
         text = settings.get('denied_reply') or ''
-        if not text or event.event_type == _PUBLIC_EVENT:
+        if not text or event.event_type in _SILENT_DENIED_EVENTS:
             return
         try:
             await event.reply(text)
         except Exception as exc:
-            report_error(EXTENSION, '频道指令', exc, context={'appid': event.appid, 'event_type': event.event_type})
+            report_error(EXTENSION, '通用指令', exc, context={'appid': event.appid, 'event_type': event.event_type})
