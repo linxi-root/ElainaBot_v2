@@ -33,6 +33,12 @@
   .row:last-child { margin-bottom: 0; }
   label.switch { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px dashed var(--line); cursor: pointer; }
   label.switch:last-of-type { border-bottom: 0; }
+  label.switch input[type="checkbox"] { position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none; }
+  label.switch .track { position: relative; flex: 0 0 auto; width: 42px; height: 24px; background: #c8cfdd; border-radius: 999px; transition: background .18s ease; }
+  label.switch .track::after { content: ''; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; background: #fff; border-radius: 50%; box-shadow: 0 1px 2px rgba(0,0,0,.25); transition: transform .18s ease; }
+  label.switch input:checked + .track { background: var(--accent); }
+  label.switch input:checked + .track::after { transform: translateX(18px); }
+  label.switch input:focus-visible + .track { outline: 2px solid rgba(91,141,239,.35); outline-offset: 2px; }
   .hint { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 8px; }
   input[type="text"], input[type="password"], textarea, select {
     width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px;
@@ -77,19 +83,19 @@
       <h2>频道指令</h2>
       <label class="switch">
         <span>启用频道指令拦截</span>
-        <input type="checkbox" id="cmd-enabled">
+        <input type="checkbox" id="cmd-enabled"><span class="track"></span>
       </label>
       <label class="switch">
         <span>@机器人时允许不带前缀的指令</span>
-        <input type="checkbox" id="cmd-at">
+        <input type="checkbox" id="cmd-at"><span class="track"></span>
       </label>
       <label class="switch">
         <span>处理公开子频道消息（MESSAGE_CREATE）</span>
-        <input type="checkbox" id="cmd-public">
+        <input type="checkbox" id="cmd-public"><span class="track"></span>
       </label>
       <label class="switch">
         <span>只把指令分发给频道专属处理器</span>
-        <input type="checkbox" id="cmd-only">
+        <input type="checkbox" id="cmd-only"><span class="track"></span>
       </label>
       <div class="row" style="margin-top:12px">
         <div style="flex:1 1 200px">
@@ -109,7 +115,7 @@
       <h2>事件日志</h2>
       <label class="switch">
         <span>显示成员名称（关闭后仅显示成员 ID）</span>
-        <input type="checkbox" id="log-name">
+        <input type="checkbox" id="log-name"><span class="track"></span>
       </label>
       <div class="hint">
         只影响本模块写入框架 lifecycle 日志与 Web 面板事件日志里的成员字段。打开时显示名称（如「睿晶琦(102042863)」），关闭时只显示成员 ID。

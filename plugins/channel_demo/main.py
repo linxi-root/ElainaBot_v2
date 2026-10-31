@@ -208,8 +208,11 @@ async def on_guild_member_add(event, match):
 
 
 # ==================== 权限扩展示例（可选）====================
-# 若要让「发图」仅频道主人可执行：
+# 若要让「发图」仅频道主人/管理员可执行：
 #   send_image 装饰器改为 @handler(r'^发图\s+(\S+)$', name='发图', desc='...',
 #                                  channel_only=True, owner_only=True)
-# 若还想让某身份组（例如子频道管理员 role_id='2'）也能执行，装饰器之后追加：
-#   send_image._role_ids = frozenset({'2'})
+# 频道主(role=4)与管理员(role=2)已内置在模块里，默认即可执行 owner_only 指令；
+# 若还想放行其它身份组（例如子频道管理员 role_id='5'），装饰器之后追加：
+#   send_image._role_ids = frozenset({'5'})
+# 若要限制为「只允许 channel_owners 白名单」则声明空集合：
+#   send_image._role_ids = frozenset()

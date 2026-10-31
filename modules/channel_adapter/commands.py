@@ -161,11 +161,13 @@ def owners_for(owners, appid):
 
 
 # ==================== 身份组放行 ====================
-# 非频道主人执行 owner_only 指令时，默认只认 handler 上显式声明的 role_ids。
-# 这里保留一个全局兜底集合，默认空集表示未声明 role_ids 的 owner_only 指令
-# 只允许 channel_owners；确实想让所有 owner_only 指令都对某些身份组开放时，
-# 再改成 frozenset({'4', '2'}) 之类的值。
-_ELEVATED_ROLE_IDS = frozenset()
+# 非频道主人执行 owner_only 指令时，先看 handler 上显式声明的 role_ids，
+# 未声明时回退到这里的全局默认身份组：
+#   4 = 频道主，2 = 管理员
+# 即频道主 / 管理员即使不在 channel_owners 白名单里，也能执行 owner_only 指令；
+# 想让某个 owner_only 指令只允许 channel_owners 时，请给该 handler 显式声明
+# 空集合（() 或 []）。
+_ELEVATED_ROLE_IDS = frozenset({'4', '2'})
 
 
 def _event_roles(event):
